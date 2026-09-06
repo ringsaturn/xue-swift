@@ -78,3 +78,9 @@ swift test
 Tests include Python-generated golden fixtures for a uniform and a mixed-cadence axis, range streaming, corruption checks, legacy schema version 1 and 2 axes, per-rule metadata rejection, and modulo-256 temporal residual reconstruction.
 
 Fixtures come from the reference pipeline's `tests/prepare_bin_fixture.py`; `tmp2m.xue` and `mixed.xue` are copied from its `tests/fixtures/generated/` output together with their expected planes.
+
+## License
+
+Dual-licensed under MIT and Apache-2.0
+([LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE)); use
+either at your option.
