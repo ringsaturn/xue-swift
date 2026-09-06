@@ -13,17 +13,16 @@ private struct Structure {
 
     func entryPosition(for request: XueFrameRequest) throws -> Int {
         guard let position = entryMap[request] else {
-            throw XueDecodeError("no plane exists for variable \(request.variableID), forecast hour \(request.forecastHour)")
+            throw XueDecodeError("no plane exists for variable \(request.variableID), frame offset \(request.frameOffset)")
         }
         return position
     }
 
     func dependency(of entry: XuePlaneEntry) -> UInt16? {
+        // ANCHOR and PREVIOUS both carry their dependency explicitly;
+        // parseStructure has pinned PREVIOUS to the preceding axis frame.
         switch entry.predictor {
-        case .anchor: return entry.dependencyHour
-        case .previous:
-            let step = UInt16(metadata.time.stepHours)
-            return entry.forecastHour >= step ? entry.forecastHour - step : nil
+        case .anchor, .previous: return entry.dependencyOffset
         case .raw, .zero: return nil
         }
     }
@@ -39,7 +38,7 @@ private struct Structure {
         while true {
             let entry = entries[try entryPosition(for: current)]
             guard let hour = dependency(of: entry) else { return chain }
-            let next = XueFrameRequest(variableID: current.variableID, forecastHour: hour)
+            let next = XueFrameRequest(variableID: current.variableID, frameOffset: hour)
             guard !chain.contains(next), chain.count < groupLimit else {
                 throw XueDecodeError("cyclic or too-deep dependency chain")
             }
@@ -116,6 +115,7 @@ private func parseStructure(_ data: Data, mode: ParseMode) throws -> Structure {
     guard let metadataJSON = String(data: metadataData, encoding: .utf8) else { throw XueDecodeError("metadata is not UTF-8") }
     let metadata: XueMetadata
     do { metadata = try JSONDecoder().decode(XueMetadata.self, from: metadataData) }
+    catch let error as XueDecodeError { throw error }
     catch { throw XueDecodeError("metadata is invalid: \(error.localizedDescription)") }
     try validateMetadata(metadata)
 
@@ -148,8 +148,8 @@ private func parseStructure(_ data: Data, mode: ParseMode) throws -> Structure {
         guard let compression = XueCompression(rawValue: try reader.u8(start + 2)) else { throw XueDecodeError("unknown compression") }
         entries.append(XuePlaneEntry(
             variableID: try reader.u8(start), predictor: predictor, compression: compression,
-            flags: try reader.u8(start + 3), forecastHour: try reader.u16(start + 4),
-            dependencyHour: try reader.u16(start + 6), groupID: try reader.u16(start + 8),
+            flags: try reader.u8(start + 3), frameOffset: try reader.u16(start + 4),
+            dependencyOffset: try reader.u16(start + 6), groupID: try reader.u16(start + 8),
             compressedLength: try reader.u32(start + 12), dataOffset: try reader.u64(start + 16),
             decodedLength: try reader.u32(start + 24), crc32: try reader.u32(start + 28),
             minimumCode: try reader.u8(start + 32), maximumCode: try reader.u8(start + 33)
@@ -162,9 +162,9 @@ private func parseStructure(_ data: Data, mode: ParseMode) throws -> Structure {
     var previousKey: (UInt8, UInt16)?
     var occupied: [(UInt64, UInt64)] = []
     for (position, entry) in entries.enumerated() {
-        let key = (entry.variableID, entry.forecastHour)
+        let key = (entry.variableID, entry.frameOffset)
         if let previousKey, key.0 < previousKey.0 || (key.0 == previousKey.0 && key.1 <= previousKey.1) {
-            throw XueDecodeError("index entries must be sorted and unique by variableId and forecastHour")
+            throw XueDecodeError("index entries must be sorted and unique by variableId and frameOffset")
         }
         previousKey = key
         guard variableIDs.contains(entry.variableID) else { throw XueDecodeError("entry references an unknown variableId") }
@@ -180,14 +180,15 @@ private func parseStructure(_ data: Data, mode: ParseMode) throws -> Structure {
             _ = try checkedEnd(entry.dataOffset, UInt64(entry.compressedLength), "payload")
             occupied.append((entry.dataOffset, UInt64(entry.compressedLength)))
         }
-        entryMap[XueFrameRequest(variableID: entry.variableID, forecastHour: entry.forecastHour)] = position
+        entryMap[XueFrameRequest(variableID: entry.variableID, frameOffset: entry.frameOffset)] = position
     }
 
+    // Frame coverage per variable, against the materialized axis — never
+    // reconstructed arithmetically when the metadata lists its offsets.
     for variableID in variableIDs {
-        for frame in 0..<metadata.time.frameCount {
-            let hour = metadata.time.firstForecastHour + frame * metadata.time.stepHours
-            guard entryMap[XueFrameRequest(variableID: variableID, forecastHour: UInt16(hour))] != nil else {
-                throw XueDecodeError("a variable does not cover every forecast hour")
+        for offset in metadata.time.frameOffsets {
+            guard entryMap[XueFrameRequest(variableID: variableID, frameOffset: offset)] != nil else {
+                throw XueDecodeError("a variable does not cover every frame of the axis")
             }
         }
     }
@@ -214,21 +215,40 @@ private func parseStructure(_ data: Data, mode: ParseMode) throws -> Structure {
 }
 
 private func validateMetadata(_ metadata: XueMetadata) throws {
-    guard metadata.schemaVersion == 1 else { throw XueDecodeError("metadata schemaVersion must be 1") }
+    guard XueFormat.schemaVersions.contains(metadata.schemaVersion) else {
+        throw XueDecodeError("unsupported metadata schemaVersion")
+    }
     guard metadata.grid.width > 0, metadata.grid.height > 0 else { throw XueDecodeError("grid dimensions must be positive") }
     let points = try checkedMultiply(UInt64(metadata.grid.width), UInt64(metadata.grid.height), label: "grid")
     guard points <= XueFormat.maxPlaneLength, points <= UInt64(UInt32.max) else { throw XueDecodeError("grid exceeds the plane safety limit") }
-    guard metadata.time.frameCount > 0, metadata.time.frameCount <= Int(UInt16.max),
-          metadata.time.firstForecastHour >= 0, metadata.time.stepHours > 0 else { throw XueDecodeError("metadata time axis is invalid") }
-    let lastHour = try checkedAdd(
-        UInt64(metadata.time.firstForecastHour),
-        checkedMultiply(UInt64(metadata.time.frameCount - 1), UInt64(metadata.time.stepHours), label: "forecast hour"),
-        label: "forecast hour"
-    )
-    guard lastHour < UInt64(UInt16.max) else { throw XueDecodeError("forecast hours exceed the u16 range") }
+    // The axis decoded into whichever shape the block declared; a version 3
+    // file must carry a unit-neutral axis and a version 1 or 2 file the
+    // hour-named one. The two shapes never mix.
+    let axisVersion = metadata.time.axisVersion
+    guard (metadata.schemaVersion >= 3) == (axisVersion == 3) else {
+        throw XueDecodeError("the time axis shape does not match the declared schemaVersion")
+    }
     guard !metadata.variables.isEmpty else { throw XueDecodeError("metadata must declare at least one variable") }
     let ids = metadata.variables.map(\.numericId)
-    guard ids.allSatisfy({ (1...5).contains($0) }), Set(ids).count == ids.count else { throw XueDecodeError("variable numericId is unknown or duplicated") }
+    // The registry (docs/format.md) assigns 1 through 6 so far; like the Rust
+    // reference decoder this accepts any single-byte id and leaves the real
+    // check to the index, whose entries must name a declared variable.
+    guard ids.allSatisfy({ (1...255).contains($0) }), Set(ids).count == ids.count else {
+        throw XueDecodeError("variable numericId is invalid or duplicated")
+    }
+    // Every axis and every variable set has exactly one valid encoding: the
+    // declared version must be the lowest able to express both.
+    let parameters = metadata.variables.filter { $0.parameter != nil }.count
+    if metadata.schemaVersion >= 3 {
+        guard parameters == metadata.variables.count else {
+            throw XueDecodeError("schemaVersion 3 requires a parameter block on every variable")
+        }
+    } else {
+        guard parameters == 0 else { throw XueDecodeError("a GRIB2 parameter block requires schemaVersion 3") }
+    }
+    guard metadata.schemaVersion == max(axisVersion, parameters > 0 ? 3 : 1) else {
+        throw XueDecodeError("metadata declares a schemaVersion other than the lowest it needs")
+    }
     for variable in metadata.variables {
         guard variable.quantization.type == "linear" || variable.quantization.type == "log1p" else { throw XueDecodeError("unknown quantization type") }
         guard variable.quantization.scale > 0,
@@ -239,29 +259,38 @@ private func validateMetadata(_ metadata: XueMetadata) throws {
 }
 
 private func validateDependencies(_ structure: Structure) throws {
-    let step = UInt16(structure.metadata.time.stepHours)
+    let offsets = structure.metadata.time.frameOffsets
+    let axisPosition = Dictionary(uniqueKeysWithValues: offsets.enumerated().map { ($1, $0) })
     for entry in structure.entries {
         switch entry.predictor {
         case .raw, .zero:
-            guard entry.dependencyHour == XueFormat.noDependency else { throw XueDecodeError("RAW and ZERO entries must have dependencyHour 65535") }
+            guard entry.dependencyOffset == XueFormat.noDependency else {
+                throw XueDecodeError("RAW and ZERO entries must have dependencyOffset 65535")
+            }
         case .anchor, .previous:
-            let dependencyHour: UInt16
+            let dependencyOffset: UInt16
             if entry.predictor == .anchor {
-                dependencyHour = entry.dependencyHour
+                dependencyOffset = entry.dependencyOffset
             } else {
-                guard entry.forecastHour >= step else { throw XueDecodeError("PREVIOUS entry has no previous forecast time") }
-                dependencyHour = entry.forecastHour - step
-                guard entry.dependencyHour == XueFormat.noDependency || entry.dependencyHour == dependencyHour else {
-                    throw XueDecodeError("PREVIOUS dependencyHour must reference the previous forecast time")
+                // PREVIOUS references the preceding frame on the time axis,
+                // carried explicitly in dependencyOffset (never the sentinel,
+                // never frameOffset - 1 by arithmetic).
+                guard let position = axisPosition[entry.frameOffset] else {
+                    throw XueDecodeError("PREVIOUS entry is not on the time axis")
+                }
+                guard position > 0 else { throw XueDecodeError("PREVIOUS entry has no preceding frame on the time axis") }
+                dependencyOffset = offsets[position - 1]
+                guard entry.dependencyOffset == dependencyOffset else {
+                    throw XueDecodeError("PREVIOUS dependencyOffset must reference the preceding frame on the time axis")
                 }
             }
-            let request = XueFrameRequest(variableID: entry.variableID, forecastHour: dependencyHour)
+            let request = XueFrameRequest(variableID: entry.variableID, frameOffset: dependencyOffset)
             guard let position = structure.entryMap[request] else { throw XueDecodeError("entry depends on a plane that does not exist") }
             guard structure.entries[position].groupID == entry.groupID else { throw XueDecodeError("dependencies must stay in one temporal group") }
         }
     }
     for entry in structure.entries {
-        _ = try structure.dependencyChain(for: XueFrameRequest(variableID: entry.variableID, forecastHour: entry.forecastHour))
+        _ = try structure.dependencyChain(for: XueFrameRequest(variableID: entry.variableID, frameOffset: entry.frameOffset))
     }
 }
 
@@ -315,7 +344,7 @@ private final class DecodeCore {
     }
 
     func check(_ plane: Data, entry: XuePlaneEntry) throws -> Data {
-        guard crc32(plane) == entry.crc32 else { throw XueDecodeError("plane CRC32 mismatch for variable \(entry.variableID), hour \(entry.forecastHour)") }
+        guard crc32(plane) == entry.crc32 else { throw XueDecodeError("plane CRC32 mismatch for variable \(entry.variableID), frame offset \(entry.frameOffset)") }
         guard let minimum = plane.min(), let maximum = plane.max(),
               minimum == entry.minimumCode, maximum == entry.maximumCode else { throw XueDecodeError("plane code range mismatch") }
         return plane
@@ -373,14 +402,16 @@ public final class XueBundle {
     public var metadataJSON: String { core.structure.metadataJSON }
     public var entries: [XuePlaneEntry] { core.structure.entries }
     public var planeLength: Int { metadata.grid.width * metadata.grid.height }
-    public var forecastHours: [UInt16] {
-        (0..<metadata.time.frameCount).map { UInt16(metadata.time.firstForecastHour + $0 * metadata.time.stepHours) }
-    }
+    /// The time axis as frame offsets, ascending.
+    public var frameOffsets: [UInt16] { metadata.time.frameOffsets }
+    /// Seconds one frame offset is worth: the frame at offset `o` is valid at
+    /// `runTime + o * unitSeconds`.
+    public var unitSeconds: Int { metadata.time.unitSeconds }
 
     public func clearCache() { core.baseCache.removeAll(keepingCapacity: true) }
 
-    public func decodeFrame(variableID: UInt8, forecastHour: UInt16) throws -> Data {
-        try core.decode(XueFrameRequest(variableID: variableID, forecastHour: forecastHour))
+    public func decodeFrame(variableID: UInt8, frameOffset: UInt16) throws -> Data {
+        try core.decode(XueFrameRequest(variableID: variableID, frameOffset: frameOffset))
     }
 
     public func decodeFrame(_ request: XueFrameRequest) throws -> Data { try core.decode(request) }
@@ -399,6 +430,11 @@ public final class XueStreamingBundle {
     public var entries: [XuePlaneEntry] { core.structure.entries }
     public var dataOffset: UInt64 { core.structure.dataOffset }
     public var fileSize: UInt64 { core.structure.fileSize }
+    /// The time axis as frame offsets, ascending.
+    public var frameOffsets: [UInt16] { metadata.time.frameOffsets }
+    /// Seconds one frame offset is worth: the frame at offset `o` is valid at
+    /// `runTime + o * unitSeconds`.
+    public var unitSeconds: Int { metadata.time.unitSeconds }
     public var totalPayloadBytes: UInt64 { entries.reduce(0) { $0 + UInt64($1.compressedLength) } }
     public var residentPayloadBytes: UInt64 {
         if case .sparse(_, let bytes) = core.store { return bytes }
@@ -438,7 +474,7 @@ public final class XueStreamingBundle {
 
     public func decodeFrame(_ request: XueFrameRequest) throws -> Data { try core.decode(request) }
 
-    public func decodeFrame(variableID: UInt8, forecastHour: UInt16) throws -> Data {
-        try core.decode(XueFrameRequest(variableID: variableID, forecastHour: forecastHour))
+    public func decodeFrame(variableID: UInt8, frameOffset: UInt16) throws -> Data {
+        try core.decode(XueFrameRequest(variableID: variableID, frameOffset: frameOffset))
     }
 }

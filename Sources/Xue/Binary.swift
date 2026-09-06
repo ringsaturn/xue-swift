@@ -9,6 +9,14 @@ enum XueFormat {
     static let noDependency = UInt16.max
     static let checksumFlag: UInt8 = 1
     static let maxPlaneLength: UInt64 = 64 * 1024 * 1024
+    /// The coarsest time-axis unit, and the only one schema versions 1 and 2
+    /// can describe. A schemaVersion 3 axis names its own unit, which must
+    /// divide it.
+    static let hourSeconds = 3600
+    /// The largest usable frame offset: 65535 is the dependencyOffset sentinel.
+    static let maximumFrameOffset = UInt16.max - 1
+    /// The metadata schema versions this decoder implements.
+    static let schemaVersions = 1...3
 }
 
 struct ByteReader {

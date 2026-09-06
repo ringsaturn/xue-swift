@@ -24,7 +24,15 @@ let package = Package(
         .testTarget(
             name: "XueTests",
             dependencies: ["Xue"],
-            resources: [.copy("tmp2m.xue"), .copy("expected.tmp2m.f000.bin")]
+            resources: [
+                .copy("tmp2m.xue"),
+                .copy("expected.tmp2m.f000.bin"),
+                .copy("mixed.xue"),
+                .copy("expected.mixed.f000.bin"),
+                .copy("expected.mixed.f004.bin"),
+                .copy("expected.mixed.f018.bin"),
+                .copy("expected.mixed.f036.bin"),
+            ]
         ),
     ]
 )
