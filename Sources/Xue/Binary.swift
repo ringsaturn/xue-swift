@@ -2,10 +2,20 @@ import Foundation
 
 enum XueFormat {
     static let magic: [UInt8] = [0x58, 0x55, 0x45, 0, 0, 0, 0, 0]
+    /// The plane-major container. Still read; no longer written upstream.
+    static let version: UInt16 = 1
+    /// The tiled container: a payload is a chunk — one tile of one temporal
+    /// group for one variable — rather than a whole plane.
+    static let versionV2: UInt16 = 2
     static let indexMagic: [UInt8] = [0x49, 0x44, 0x58, 0x31]
+    static let indexMagicV2: [UInt8] = [0x49, 0x44, 0x58, 0x32]
     static let headerSize = 80
     static let indexHeaderSize = 16
+    static let indexHeaderSizeV2 = 32
     static let entrySize = 40
+    static let variableEntrySize = 4
+    static let groupEntrySize = 4
+    static let chunkEntrySize = 8
     static let noDependency = UInt16.max
     static let checksumFlag: UInt8 = 1
     static let maxPlaneLength: UInt64 = 64 * 1024 * 1024

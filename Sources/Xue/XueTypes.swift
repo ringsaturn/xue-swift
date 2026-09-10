@@ -379,3 +379,87 @@ public struct XueDecodeError: Error, LocalizedError, CustomStringConvertible, Se
     public var description: String { message }
     public var errorDescription: String? { message }
 }
+
+/// How a container v2 grid is cut into tiles: arithmetic over the metadata
+/// grid and the index header, stored nowhere in the file.
+///
+/// Tiles start at the grid's first cell and are laid out row-major; the last
+/// column and the last row are clipped to the grid, so a tile size need not
+/// divide the grid. A tile is cells, never degrees — the horizontal wrap of a
+/// global grid is a property of the grid, not of any tile.
+public struct XueTileGeometry: Equatable, Sendable {
+    public let width: Int
+    public let height: Int
+    public let tileWidth: Int
+    public let tileHeight: Int
+
+    public init(width: Int, height: Int, tileWidth: Int, tileHeight: Int) throws {
+        guard width > 0, height > 0, tileWidth >= 1, tileHeight >= 1,
+              tileWidth <= width, tileHeight <= height else {
+            throw XueDecodeError("tile size must be between 1 and the grid dimensions")
+        }
+        self.width = width
+        self.height = height
+        self.tileWidth = tileWidth
+        self.tileHeight = tileHeight
+    }
+
+    public var columns: Int { (width + tileWidth - 1) / tileWidth }
+    public var rows: Int { (height + tileHeight - 1) / tileHeight }
+    public var count: Int { columns * rows }
+
+    /// The (row, column) of a tile's north-west cell in the grid.
+    public func origin(of tile: Int) -> (row: Int, column: Int) {
+        ((tile / columns) * tileHeight, (tile % columns) * tileWidth)
+    }
+
+    /// The clipped (height, width) of a tile in cells.
+    public func shape(of tile: Int) -> (height: Int, width: Int) {
+        let origin = origin(of: tile)
+        return (min(tileHeight, height - origin.row), min(tileWidth, width - origin.column))
+    }
+
+    /// The tile containing a grid cell.
+    public func tile(row: Int, column: Int) throws -> Int {
+        guard row >= 0, column >= 0, row < height, column < width else {
+            throw XueDecodeError("cell is outside the grid")
+        }
+        return (row / tileHeight) * columns + column / tileWidth
+    }
+}
+
+/// A rectangle of tiles, the unit a viewport asks for. Inclusive of both ends.
+public struct XueTileRect: Equatable, Sendable {
+    public let firstColumn: Int
+    public let firstRow: Int
+    public let lastColumn: Int
+    public let lastRow: Int
+
+    public init(firstColumn: Int, firstRow: Int, lastColumn: Int, lastRow: Int) {
+        self.firstColumn = firstColumn
+        self.firstRow = firstRow
+        self.lastColumn = lastColumn
+        self.lastRow = lastRow
+    }
+
+    /// The tiles a grid rectangle of cells touches, clamped to the geometry.
+    public static func covering(
+        _ geometry: XueTileGeometry, row: Int, column: Int, height: Int, width: Int
+    ) -> XueTileRect {
+        let lastRow = min(row + max(0, height - 1), geometry.height - 1)
+        let lastColumn = min(column + max(0, width - 1), geometry.width - 1)
+        return XueTileRect(
+            firstColumn: max(0, min(column, geometry.width - 1)) / geometry.tileWidth,
+            firstRow: max(0, min(row, geometry.height - 1)) / geometry.tileHeight,
+            lastColumn: max(0, lastColumn) / geometry.tileWidth,
+            lastRow: max(0, lastRow) / geometry.tileHeight
+        )
+    }
+
+    public func contains(_ tile: Int, in geometry: XueTileGeometry) -> Bool {
+        let row = tile / geometry.columns
+        let column = tile % geometry.columns
+        return (firstRow...max(firstRow, lastRow)).contains(row)
+            && (firstColumn...max(firstColumn, lastColumn)).contains(column)
+    }
+}

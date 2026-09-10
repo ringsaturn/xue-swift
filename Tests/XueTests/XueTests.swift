@@ -292,3 +292,192 @@ private func appendEntry(
     index.append(plane.max()!)
     index.append(contentsOf: repeatElement(0, count: 6))
 }
+
+// MARK: - Container v2
+
+/// The synthetic tiled fixture (the reference pipeline's
+/// `prepare_tiled_fixture`): a 17 x 9 grid cut into 5 x 4 tiles, so the last
+/// tile column is two cells wide and the last tile row one cell tall; two
+/// variables, one chained against the previous frame and one stacked RAW;
+/// the mixed-cadence axis whose last group is short.
+private let tiledHours: [UInt16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 18, 21, 24, 27, 30, 33, 36]
+private let tiledWidth = 17
+private let tiledHeight = 9
+
+private func tiledBytes() throws -> Data {
+    try Data(contentsOf: #require(Bundle.module.url(forResource: "tiled", withExtension: "xue", subdirectory: "tiled")))
+}
+
+private func tiledExpected(variableID: UInt8, hour: UInt16) throws -> Data {
+    let name = String(format: "expected.tiled.v%d.f%03d", Int(variableID), Int(hour))
+    return try Data(contentsOf: #require(Bundle.module.url(forResource: name, withExtension: "bin", subdirectory: "tiled")))
+}
+
+@Test func tiledGoldenPlanesMatchPythonDecoder() throws {
+    let bundle = try XueBundle(data: tiledBytes())
+    let geometry = try #require(bundle.tileGeometry)
+    #expect(geometry.tileWidth == 5)
+    #expect(geometry.tileHeight == 4)
+    #expect(geometry.columns == 4)
+    #expect(geometry.rows == 3)
+    #expect(geometry.count == 12)
+    #expect(geometry.shape(of: 11) == (1, 2))
+    #expect(geometry.origin(of: 11) == (8, 15))
+    #expect(bundle.entries.isEmpty)
+    #expect(bundle.frameOffsets == tiledHours)
+    for variableID: UInt8 in [1, 2] {
+        for hour in tiledHours {
+            #expect(try bundle.decodeFrame(variableID: variableID, frameOffset: hour) == tiledExpected(variableID: variableID, hour: hour), "variable \(variableID) f\(hour)")
+        }
+    }
+    // Scrubbing backwards across group boundaries reads from the cache and
+    // from rebuilt groups alike.
+    for hour in tiledHours.reversed() {
+        #expect(try bundle.decodeFrame(variableID: 1, frameOffset: hour) == tiledExpected(variableID: 1, hour: hour))
+    }
+}
+
+@Test func tiledSeriesMatchesThePlanesAndTheGoldenCell() throws {
+    let bundle = try XueBundle(data: tiledBytes())
+    for variableID: UInt8 in [1, 2] {
+        for (column, row) in [(0, 0), (16, 8), (15, 8), (4, 3), (5, 4), (12, 7)] {
+            let series = try bundle.decodeSeries(variableID: variableID, column: column, row: row)
+            let expected = try Data(tiledHours.map { hour in
+                try tiledExpected(variableID: variableID, hour: hour)[row * tiledWidth + column]
+            })
+            #expect(series == expected, "variable \(variableID) at (\(column), \(row))")
+        }
+        let name = "expected.tiled.v\(variableID).series"
+        let golden = try Data(contentsOf: #require(Bundle.module.url(forResource: name, withExtension: "bin", subdirectory: "tiled")))
+        // The reference dumps the series of one cell; find which by matching.
+        var matched = false
+        for row in 0..<tiledHeight where !matched {
+            for column in 0..<tiledWidth where !matched {
+                if try bundle.decodeSeries(variableID: variableID, column: column, row: row) == golden { matched = true }
+            }
+        }
+        #expect(matched, "golden series for variable \(variableID) belongs to some cell")
+    }
+    #expect(throws: XueDecodeError.self) { try bundle.decodeSeries(variableID: 1, column: 17, row: 0) }
+    #expect(throws: XueDecodeError.self) { try bundle.decodeSeries(variableID: 9, column: 0, row: 0) }
+}
+
+@Test func tiledPartialDecodeMatchesTheWholePlane() throws {
+    let bundle = try XueBundle(data: tiledBytes())
+    let geometry = try #require(bundle.tileGeometry)
+    let expected = try tiledExpected(variableID: 1, hour: 9)
+    // Cells (3..6, 2..7): tiles in columns 0-1 and rows 0-1.
+    let rect = XueTileRect.covering(geometry, row: 2, column: 3, height: 6, width: 4)
+    #expect(rect == XueTileRect(firstColumn: 0, firstRow: 0, lastColumn: 1, lastRow: 1))
+    let plane = try bundle.decodeFrame(XueFrameRequest(variableID: 1, frameOffset: 9), tiles: rect)
+    for tile in 0..<geometry.count {
+        let origin = geometry.origin(of: tile)
+        let shape = geometry.shape(of: tile)
+        for row in 0..<shape.height {
+            let start = (origin.row + row) * tiledWidth + origin.column
+            let end = start + shape.width
+            if rect.contains(tile, in: geometry) {
+                #expect(plane[start..<end] == expected[start..<end], "tile \(tile)")
+            } else {
+                #expect(plane[start..<end].allSatisfy { $0 == 0 }, "tile \(tile) left blank")
+            }
+        }
+    }
+}
+
+@Test func tiledStreamingMatchesFullDecode() throws {
+    let bytes = try tiledBytes()
+    let full = try XueBundle(data: bytes)
+    let dataOffset = Int(readUInt64(bytes, at: 56))
+    let streaming = try XueStreamingBundle(prefix: bytes.prefix(dataOffset))
+    #expect(streaming.tileGeometry == full.tileGeometry)
+    #expect(streaming.residentPayloadBytes == 0)
+    #expect(streaming.totalPayloadBytes == UInt64(bytes.count) - UInt64(dataOffset) - UInt64(bytes.suffix(from: dataOffset).reversed().prefix { $0 == 0 }.count))
+
+    let request = XueFrameRequest(variableID: 2, frameOffset: 18)
+    #expect(throws: XueDecodeError.self) { try streaming.decodeFrame(request) }
+    // The whole group — every tile, every variable — is one contiguous span,
+    // while one variable's chunks alone are interleaved with the other's and
+    // so stay one span per tile.
+    let range = try #require(try streaming.missingGroupRange(for: request))
+    #expect(try streaming.missingSpans(for: request, tiles: nil).count == 12)
+    try streaming.insertRange(offset: range.lowerBound, data: bytes.subdata(in: Int(range.lowerBound)..<Int(range.upperBound)))
+    #expect(try streaming.missingGroupRange(for: request) == nil)
+    #expect(try streaming.missingGroupRange(for: XueFrameRequest(variableID: 1, frameOffset: 15)) == nil)
+    #expect(try streaming.missingSpans(for: request, tiles: nil).isEmpty)
+    for hour: UInt16 in [15, 18, 21] {
+        for variableID: UInt8 in [1, 2] {
+            let request = XueFrameRequest(variableID: variableID, frameOffset: hour)
+            #expect(try streaming.decodeFrame(request) == full.decodeFrame(request))
+        }
+    }
+    // The last group is still missing, and a viewport asks for less of it:
+    // the four tiles of a 2 x 2 rectangle, one span each because the other
+    // variable's chunks sit between them.
+    let later = XueFrameRequest(variableID: 1, frameOffset: 33)
+    let geometry = try #require(streaming.tileGeometry)
+    let rect = XueTileRect(firstColumn: 1, firstRow: 1, lastColumn: 2, lastRow: 2)
+    let spans = try streaming.missingSpans(for: later, tiles: rect)
+    #expect(spans.count == 4)
+    for span in spans {
+        try streaming.insertRange(offset: span.lowerBound, data: bytes.subdata(in: Int(span.lowerBound)..<Int(span.upperBound)))
+    }
+    #expect(try streaming.missingSpans(for: later, tiles: rect).isEmpty)
+    #expect(try streaming.missingSpans(for: later, tiles: nil).isEmpty == false)
+    let partial = try streaming.decodeFrame(later, tiles: rect)
+    let whole = try full.decodeFrame(later)
+    for tile in 0..<geometry.count where rect.contains(tile, in: geometry) {
+        let origin = geometry.origin(of: tile)
+        let shape = geometry.shape(of: tile)
+        for row in 0..<shape.height {
+            let start = (origin.row + row) * tiledWidth + origin.column
+            #expect(partial[start..<(start + shape.width)] == whole[start..<(start + shape.width)])
+        }
+    }
+    // A series needs one chunk per group of one tile; the group fetched
+    // whole above is already there.
+    let seriesSpans = try streaming.missingSeriesSpans(variableID: 2, column: 16, row: 8)
+    #expect(seriesSpans.count == 4)
+    for span in seriesSpans {
+        try streaming.insertRange(offset: span.lowerBound, data: bytes.subdata(in: Int(span.lowerBound)..<Int(span.upperBound)))
+    }
+    #expect(try streaming.decodeSeries(variableID: 2, column: 16, row: 8) == full.decodeSeries(variableID: 2, column: 16, row: 8))
+}
+
+@Test func tiledCorruptionIsRejected() throws {
+    let original = try tiledBytes()
+    let indexOffset = Int(readUInt64(original, at: 40))
+    // A flipped chunk CRC in the index fails the decode of exactly that
+    // group; the structure itself still parses.
+    var badCRC = original
+    badCRC[indexOffset + 32 + 2 * 4 + 5 * 4 + 4] ^= 0xff
+    let bundle = try XueBundle(data: badCRC)
+    #expect(throws: XueDecodeError.self) { try bundle.decodeFrame(variableID: 1, frameOffset: 0) }
+    #expect(try bundle.decodeFrame(variableID: 1, frameOffset: 12) == tiledExpected(variableID: 1, hour: 12))
+
+    // A predictor v2 does not allow, a reserved word, a broken partition.
+    var badPredictor = original
+    badPredictor[indexOffset + 32 + 1] = 1
+    #expect(throws: XueDecodeError.self) { try XueBundle(data: badPredictor) }
+    var badReserved = original
+    badReserved[indexOffset + 20] = 1
+    #expect(throws: XueDecodeError.self) { try XueBundle(data: badReserved) }
+    var badGroup = original
+    badGroup[indexOffset + 32 + 2 * 4 + 4 + 2] += 1
+    #expect(throws: XueDecodeError.self) { try XueBundle(data: badGroup) }
+    var badTile = original
+    badTile[indexOffset + 8] = 18
+    #expect(throws: XueDecodeError.self) { try XueBundle(data: badTile) }
+
+    // Truncations never crash.
+    for length in stride(from: 0, to: original.count, by: 97) {
+        #expect(throws: XueDecodeError.self) { try XueBundle(data: original.prefix(length)) }
+    }
+    // A v1 reader's tile calls fail cleanly on a v1 file.
+    let v1 = try XueBundle(contentsOf: #require(Bundle.module.url(forResource: "mixed", withExtension: "xue")))
+    #expect(v1.tileGeometry == nil)
+    #expect(throws: XueDecodeError.self) { try v1.decodeSeries(variableID: 1, column: 0, row: 0) }
+    #expect(throws: XueDecodeError.self) {
+        try v1.decodeFrame(XueFrameRequest(variableID: 1, frameOffset: 0), tiles: XueTileRect(firstColumn: 0, firstRow: 0, lastColumn: 0, lastRow: 0))
+    }
+}

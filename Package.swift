@@ -32,6 +32,7 @@ let package = Package(
                 .copy("expected.mixed.f004.bin"),
                 .copy("expected.mixed.f018.bin"),
                 .copy("expected.mixed.f036.bin"),
+                .copy("tiled"),
             ]
         ),
     ]
