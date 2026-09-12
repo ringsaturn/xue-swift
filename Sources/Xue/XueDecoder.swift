@@ -476,9 +476,10 @@ private func validateMetadata(_ metadata: XueMetadata) throws {
     }
     guard !metadata.variables.isEmpty else { throw XueDecodeError("metadata must declare at least one variable") }
     let ids = metadata.variables.map(\.numericId)
-    // The registry (docs/format.md) assigns 1 through 6 so far; like the Rust
-    // reference decoder this accepts any single-byte id and leaves the real
-    // check to the index, whose entries must name a declared variable.
+    // A variableId is a file-local handle (docs/format.md, "variableId is
+    // file-local"): there is no registry to check it against, and a decoder
+    // must not carry one. Any single-byte id is valid as long as it is unique
+    // within the file; the index is then held to naming only declared ids.
     guard ids.allSatisfy({ (1...255).contains($0) }), Set(ids).count == ids.count else {
         throw XueDecodeError("variable numericId is invalid or duplicated")
     }

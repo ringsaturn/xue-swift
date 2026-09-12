@@ -83,6 +83,25 @@ import Testing
     #expect(try bundle.decodeFrame(variableID: 1, frameOffset: 1) == syntheticPlanes[1])
 }
 
+/// A variableId is a handle into this file's metadata and nothing more: an
+/// id no encoder has ever assigned decodes like any other, and an index
+/// entry naming an id the metadata does not declare is the only "unknown"
+/// variableId there is.
+@Test func variableIDsAreFileLocal() throws {
+    let metadata = offsetAxisMetadata(variableID: 200)
+    let bundle = try XueBundle(data: makeAnchorBundle(metadata: metadata, offsets: [0, 1], variableID: 200))
+    #expect(bundle.metadata.variables.map(\.numericId) == [200])
+    #expect(try bundle.decodeFrame(variableID: 200, frameOffset: 1) == syntheticPlanes[1])
+    #expect(throws: XueDecodeError.self) { try bundle.decodeFrame(variableID: 1, frameOffset: 1) }
+
+    #expect(throws: XueDecodeError.self) {
+        try XueBundle(data: makeAnchorBundle(metadata: metadata, offsets: [0, 1], variableID: 1))
+    }
+    #expect(throws: XueDecodeError.self) {
+        try XueBundle(data: makeAnchorBundle(metadata: offsetAxisMetadata(variableID: 0), offsets: [0, 1], variableID: 0))
+    }
+}
+
 /// Bundles published under the legacy whole-hour axes stay readable.
 @Test func legacyHourAxesRemainReadable() throws {
     let uniform = try XueBundle(data: makeAnchorBundle(
@@ -166,12 +185,14 @@ private func offsetAxisMetadata(
     unitSeconds: Int = 3600,
     axis: String = #""firstFrameOffset":0,"frameStep":1"#,
     parameter: String = defaultParameter,
-    frameCount: Int = 2
+    frameCount: Int = 2,
+    variableID: UInt8 = 1
 ) -> String {
     makeMetadata(
         schemaVersion: schemaVersion,
         time: #""unitSeconds":\#(unitSeconds),\#(axis),"frameCount":\#(frameCount)"#,
-        parameter: #""parameter":{\#(parameter)},"#
+        parameter: #""parameter":{\#(parameter)},"#,
+        variableID: variableID
     )
 }
 
@@ -187,13 +208,13 @@ private func hourAxisMetadata(
     )
 }
 
-private func makeMetadata(schemaVersion: Int, time: String, parameter: String) -> String {
+private func makeMetadata(schemaVersion: Int, time: String, parameter: String, variableID: UInt8 = 1) -> String {
     #"""
     {"schemaVersion":\#(schemaVersion),"model":"TEST","product":"test","runTime":"2026-01-01T00:00:00Z",\#
     "time":{\#(time)},\#
     "grid":{"width":2,"height":2,"layout":"row-major","rowOrder":"north-to-south","columnOrder":"west-to-east",\#
     "firstLongitude":-180,"firstLatitude":90,"longitudeStep":1,"latitudeStep":-1,"wrapLongitude":true},\#
-    "variables":[{"numericId":1,"id":"tmp2m","label":"temperature","unit":"C",\#(parameter)\#
+    "variables":[{"numericId":\#(variableID),"id":"tmp2m","label":"temperature","unit":"C",\#(parameter)\#
     "quantization":{"type":"linear","offset":-60,"scale":0.5,"minimumCode":0,"maximumCode":254,"nodataCode":255}}]}
     """#
 }
@@ -221,7 +242,9 @@ private func align(_ value: Int) -> Int { (value + 7) / 8 * 8 }
 
 /// A single-variable bundle with uncompressed payloads: a RAW anchor on the
 /// first frame offset, and one ANCHOR residual against it per later frame.
-private func makeAnchorBundle(metadata json: String, offsets: [UInt16]) -> Data {
+/// `variableID` is what the index entries carry, which need not be what the
+/// metadata declares when a case wants that mismatch.
+private func makeAnchorBundle(metadata json: String, offsets: [UInt16], variableID: UInt8 = 1) -> Data {
     let metadata = Data(json.utf8)
     let indexOffset = align(80 + metadata.count)
     let indexLength = 16 + offsets.count * 40
@@ -257,6 +280,7 @@ private func makeAnchorBundle(metadata json: String, offsets: [UInt16]) -> Data 
     var payloadOffset = dataOffset
     for (position, offset) in offsets.enumerated() {
         appendEntry(
+            variableID: variableID,
             predictor: position == 0 ? 0 : 1,
             offset: offset,
             dependency: position == 0 ? UInt16.max : offsets[0],
@@ -273,10 +297,10 @@ private func makeAnchorBundle(metadata json: String, offsets: [UInt16]) -> Data 
 }
 
 private func appendEntry(
-    predictor: UInt8, offset: UInt16, dependency: UInt16,
+    variableID: UInt8, predictor: UInt8, offset: UInt16, dependency: UInt16,
     payloadOffset: Int, plane: Data, payloadLength: UInt32, to index: inout Data
 ) {
-    index.append(1)
+    index.append(variableID)
     index.append(predictor)
     index.append(0)
     index.append(0)

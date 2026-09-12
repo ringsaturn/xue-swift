@@ -30,6 +30,13 @@ print(bundle.metadata.grid.height)
 
 The returned `Data` contains one row-major quantized byte per grid point. Use the selected variable's `metadata.variables[].quantization` values to convert codes to scalar values.
 
+`variableID` is the variable's `numericId` in this file's metadata — a file-local handle, not a name. The reference encoders number a bundle's variables 1…n by position (so a scalar bundle is always `1`, a wind bundle `1` for U and `2` for V), files published before that rule carry other numbers, and the decoder accepts any unique single-byte id either way. Look the id up from the metadata rather than assuming it, and identify a field by its `parameter` block (below), never by its number:
+
+```swift
+let temperature = bundle.metadata.variables.first { $0.id == "tmp2m" }!
+let plane = try bundle.decodeFrame(variableID: UInt8(temperature.numericId), frameOffset: 6)
+```
+
 A plane is keyed by its **frame offset** on the metadata time axis, not by a forecast hour: the frame at offset `o` is valid at `runTime + o * unitSeconds`. `bundle.frameOffsets` lists the axis and `bundle.unitSeconds` gives the unit — 3600 for every forecast source, which leaves its offsets equal to its forecast hours, and finer for a sub-hourly observation series.
 
 ```swift
@@ -99,9 +106,9 @@ if let geometry = stream.tileGeometry {
 swift test
 ```
 
-Tests include Python-generated golden fixtures for a uniform and a mixed-cadence axis, a tiled v2 bundle with clipped tiles and both predictors (planes, a cell series, partial decodes), range streaming in both versions, corruption checks, legacy schema version 1 and 2 axes, per-rule metadata rejection, and modulo-256 temporal residual reconstruction.
+Tests include Python-generated golden fixtures for a uniform and a mixed-cadence axis, a tiled v2 bundle with clipped tiles and both predictors (planes, a cell series, partial decodes), range streaming in both versions, corruption checks, legacy schema version 1 and 2 axes, per-rule metadata rejection, file-local variable ids, and modulo-256 temporal residual reconstruction.
 
-Fixtures come from the reference pipeline's `tests/prepare_bin_fixture.py`; `tmp2m.xue`, `mixed.xue` and `tiled/tiled.xue` are copied from its `tests/fixtures/generated/` output together with their expected planes and series.
+Fixtures come from the reference pipeline's `tests/fixtures/generated/` output, with their expected planes and series: `mixed.xue` and `tiled/tiled.xue` from `tests/prepare_bin_fixture.py`, and `tmp2m.xue` from the encoder itself, kept as the v1 container it wrote at the time (the reference now writes v2 by default, which `tiled.xue` covers).
 
 ## License
 
